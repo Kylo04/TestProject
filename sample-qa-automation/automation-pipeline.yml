@@ -1,0 +1,169 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: ENV
+    displayName: Environment
+    type: string
+    default: qa
+    values:
+      - uat
+      - qa
+      - stage
+      - dev
+
+  - name: TEST_TAG
+    displayName: Which pack to run
+    type: stringList
+    default: smoke
+    values:
+      - smoke
+      - regression
+      - selected
+      - check
+      - sanity
+      - func1
+      - func2				
+
+pool:
+  name: DockerAgents
+  demands: maven
+
+stages:
+  - stage: TestStage
+    displayName: "Cucumber Parallel Execution"
+
+    jobs:
+      - job: "CucumberTests"
+        displayName: "Distributed Cucumber Tests"
+        timeoutInMinutes: 30
+
+        strategy:
+          matrix:
+            agent1:
+              AGENT_INDEX: 1
+              displayName: "Agent 1"
+            agent2:
+              AGENT_INDEX: 2
+              displayName: "Agent 2"
+            agent3:
+              AGENT_INDEX: 3
+              displayName: "Agent 3"
+
+        variables:
+          MAVEN_LOCAL_REPO: $(Pipeline.Workspace)/repository
+          MAVEN_OPTS: "-Xms128m -Xmx1g -Dfile.encoding=UTF-8 -Dmaven.repo.local=$(MAVEN_LOCAL_REPO)"
+
+        steps:
+
+          - task: Cache@2
+            displayName: Cache Dependencies
+            inputs:
+              key: maven | "$(Agent.OS)" | **/pom.xml
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+                maven
+              path: $(MAVEN_LOCAL_REPO)
+
+          - task: Bash@3
+            name: ExtractScenarios
+            displayName: "Extract Cucumber Scenarios"
+            inputs:
+              targetType: inline
+              script: |
+                tags=(${{ join(' ', parameters.TEST_TAG) }})
+          
+                TAG_EXPR=""
+                for tag in "${tags[@]}"; do
+                  if [[ -z "$TAG_EXPR" ]]; then
+                    TAG_EXPR="@$tag"
+                  else
+                    TAG_EXPR="$TAG_EXPR or @$tag"
+                  fi
+                done
+          
+                echo "Tag expression: $TAG_EXPR"
+                
+                mvn test \
+                  "-Dcucumber.execution.dry-run=true" \
+                  "-Denv=${{ parameters.ENV }}" \
+                  "-Dcucumber.filter.tags=$TAG_EXPR" \
+                  "-Dcucumber.plugin=pretty" > scenarios.txt
+          
+                echo "==== RAW OUTPUT ===="
+                cat scenarios.txt
+          
+                mapfile -t scenarios < <(grep -oE '#[[:space:]]*features/[^ ]+\.feature:[0-9]+' scenarios.txt | sed 's/^# *//')
+          
+                echo "Extracted scenarios count: ${#scenarios[@]}"
+                printf '%s\n' "${scenarios[@]}"
+          
+                if [[ ${#scenarios[@]} -eq 0 ]]; then
+                  echo "No scenarios extracted"
+                  exit 1
+                fi
+          
+                printf '%s\n' "${scenarios[@]}" > target/all.txt           
+
+          - task: Bash@3
+            name: SplitScenarios
+            displayName: "Split Scenarios Across Agents"
+            inputs:
+              targetType: inline
+              script: |
+                mapfile -t scenarios < target/all.txt
+          
+                total=${#scenarios[@]}
+                echo "Total scenarios: $total"
+          
+                if [[ "$total" -eq 0 ]]; then
+                  echo "No scenarios found"
+                  exit 1
+                fi
+          
+                index=$((AGENT_INDEX - 1))
+                stride=3
+          
+                > target/selected.txt
+          
+                for ((i=index; i<total; i+=stride)); do
+                  echo "${scenarios[$i]}" >> target/selected.txt
+                done
+          
+                echo "Selected scenarios:"
+                cat target/selected.txt  
+
+          - task: Bash@3
+            displayName: "Run Cucumber CLI (Agent $(AGENT_INDEX))"
+            inputs:
+              targetType: inline
+              script: |
+          
+                echo "Building classpath..."
+                mvn -q -DincludeScope=test -Dmdep.outputFile=cp.txt dependency:build-classpath
+                CLASSPATH=$(cat cp.txt)
+                CLASSPATH="$CLASSPATH:target/classes:target/test-classes"
+          
+                echo "Preparing scenarios..."
+                SCENARIOS=$(sed 's|^features/|src/test/resources/features/|' target/selected.txt | tr '\n' ' ')
+          
+                echo "Running scenarios:"
+                echo "$SCENARIOS"
+                
+                java -cp "$CLASSPATH" io.cucumber.core.cli.Main \
+                --glue qa.automation \
+                --plugin pretty \
+                --plugin qa.automation.reporting.cucumber.CucumberEventListener \
+                --plugin json:target/cucumber.json \
+                $SCENARIOS  
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Custom Report"
+            condition: always()
+            inputs:
+              targetPath: 'target/reports'
+              artifact: 'cucumber-report-$(AGENT_INDEX)'
